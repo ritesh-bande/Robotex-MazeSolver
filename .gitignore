@@ -1,0 +1,16 @@
+.vscode/
+*.o
+*.exe
+*.elf
+*.bin
+*.hex
+
+build/
+Debug/
+Release/
+
+*.log
+
+node_modules/
+
+.env

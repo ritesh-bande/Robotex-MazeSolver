@@ -68,7 +68,7 @@ unsigned long curtime = 0;  // for timing budget (unsigned long matches millis()
 
 int distLeft = 0, distFront = 0, distRight = 0;
 
-const int baseSpeed    = 150;   // cruise speed while wall-following
+const int baseSpeed    = 220;   // cruise speed while wall-following
 const int targetDist   = 45;    // mm, desired wall distance
 const int frontThresh  = 150;   // mm, below this = front obstacle
 const int wallThresh   = 90;   // mm, above this = wall considered missing
@@ -77,10 +77,12 @@ const int innerSpeed   = 70;    // slow wheel while searching for a missing wall
 const int rotationSpeed = 180;  // in-place turn cruise speed
 
 // ---------------- Wall PID ----------------
-float Kp = 0.5;
-float Ki = 0.0;
-float Kd = 0.0;
+float Kp = 0.56;
+float Ki = 0;
+float Kd = 0.085;
 float pidPrev = 0, pidInt = 0;
+
+// basespeed=180,kp=0.45,maxspeed=200
 
 // Light smoothing on the raw sensor readings only (does not change how
 // distLeft/distFront/distRight are used anywhere else in the code) —
@@ -99,6 +101,9 @@ void mspeed(int a, int b) {
   analogWrite(PWMA, abs(a));
   digitalWrite(BIN1, b >= 0); digitalWrite(BIN2, b < 0);
   analogWrite(PWMB, abs(b));
+}
+void stopmotors(){
+  mspeed(0,0);
 }
 
 // ---------------- Sensors ----------------
@@ -211,8 +216,8 @@ void runWallPIDSingle (float measured, int desired, bool invertMirror) {
   // "speed up" direction with far less headroom than "slow down", which
   // biased steering toward whichever side happened to need the smaller
   // correction. Now both directions have equal room to act.
-  int leftSp  = constrain((int)(baseSpeed - pid), 30, 255);
-  int rightSp = constrain((int)(baseSpeed + pid), 30, 255);
+  int leftSp  = constrain((int)(baseSpeed - pid), 30, 240);
+  int rightSp = constrain((int)(baseSpeed + pid), 30, 240);
   mspeed(leftSp, rightSp);
 }
 
@@ -408,7 +413,12 @@ void setup() {
 void loop() {
   // behaviorStep();
   updateSensors();
+  if(distFront<150){
+    stopmotors();
+  }
+  else{
   runWallPIDSingle(distRight, targetDist, false);
+  }
   
   // while (millis() - curtime < (unsigned long)timingBudget) { /* hold cadence */ }
   // curtime = millis();
