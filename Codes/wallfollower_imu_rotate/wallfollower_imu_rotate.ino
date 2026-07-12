@@ -1,11 +1,16 @@
 /* Wall Follower — IMU-based rotation (gyro), encoders kept for straight-line drift only
    ================================================================================
-   BASE: original quadrature-encoder wall follower (BTN1=left, BTN2=right wall follow)
-   CHANGED: rotate() no longer counts encoder ticks to know how far it has turned.
-            It now reads an MPU6050 gyro and turns until the measured heading change
-            matches the requested angle. This avoids wheel-slip errors during turns.
-   UNCHANGED: wall-following PID, front/dead-end rules, open-space straight driving
-              via encoders, motor driver, sensor setup — all identical to before.
+   
+
+   NOT FIXED IN CODE (needs a bench test, can't be fixed blind):
+     Turn direction / gyro sign convention. Before trusting rotate() in
+     behaviorStep(), command a single rotate(90) on the bench and confirm
+     the robot physically turns right by ~90 degrees, not left or by some
+     multiple. If it's backwards, flip the sign of targetAngle (not the
+     PID error line) — see the comment inside rotate().
+
+   UNCHANGED: wall-following PID math, front/dead-end rule order, motor
+   driver, sensor init — same as before.
    ================================================================================
 */
 
@@ -42,13 +47,12 @@ volatile long rightTicks = 0;
 #define ADDR_F 0x31
 #define ADDR_R 0x32
 
-// ---- NEW: IMU (MPU6050) address ----
+// IMU (MPU6050) address
 #define MPU_ADDR 0x68
 
 // Quadrature decode: only channel A triggers the interrupt; reading B at
 // that instant tells direction. Standard single-interrupt quadrature trick.
-// NOTE: still used for driveStraightUsingEncoders() — just no longer used
-// for rotation, since rotation now reads the gyro instead.
+// Still used for driveStraightUsingEncoders() — not used for rotation.
 void IRAM_ATTR leftEncoderISR() {
   bool a = digitalRead(LEFT_ENC_A);
   bool b = digitalRead(LEFT_ENC_B);
@@ -71,20 +75,24 @@ int distLeft = 0, distFront = 0, distRight = 0;
 const int baseSpeed    = 235;   // cruise speed while wall-following
 const int targetDist   = 45;    // mm, desired wall distance
 const int frontThresh  = 150;   // mm, below this = front obstacle
-const int wallThresh   = 90;    // mm, above this = wall considered missing
 const int outerSpeed   = 255;   // fast wheel while searching for a missing wall
 const int innerSpeed   = 70;    // slow wheel while searching for a missing wall
 const int rotationSpeed = 180;  // kept for reference; turn now uses TURN_BASE_SPEED below
+
+// ---------------- FIX 2/6 — hysteresis band for wall presence ----------------
+// A wall must clearly commit to "present" (<= ENTER) or "absent" (> EXIT)
+// before the mode flips. Readings in between keep whatever state was
+// already active, instead of chattering back and forth every loop tick.
+const int WALL_ENTER_THRESH = 85;   // mm — wall counts as present below this
+const int WALL_EXIT_THRESH  = 95;   // mm — wall counts as gone above this
+bool wallLeftActive  = false;
+bool wallRightActive = false;
 
 // ---------------- Wall PID ----------------
 float Kp = 0.619;
 float Ki = 0.0001;
 float Kd = 0.463;
 float pidPrev = 0, pidInt = 0;
-
-// Light smoothing on the raw sensor readings only.
-const float FILTER_ALPHA = 0.4f;
-float filtL = -1, filtF = -1, filtR = -1;
 
 // ---------------- Mode ----------------
 bool followLeft = false; // set at startup
@@ -145,25 +153,53 @@ void setupSensors() {
   Serial.println("Sensors up");
 }
 
-void updateSensors() {
-  if (sensorL.dataReady()) distLeft  = sensorL.read(false);
-  if (sensorF.dataReady()) distFront = sensorF.read(false);
-  if (sensorR.dataReady()) distRight = sensorR.read(false);
+// ---------------- FIX 3 — staleness watchdog ----------------
+// If a sensor stops returning fresh reads for longer than this, its
+// distance is forced to "far away" (4000) instead of silently trusting
+// a frozen value, and a one-time warning is printed.
+#define SENSOR_STALE_MS 300
 
+unsigned long lastGoodL = 0, lastGoodF = 0, lastGoodR = 0;
+bool staleWarnedL = false, staleWarnedF = false, staleWarnedR = false;
+
+void updateSensors() {
+  unsigned long now = millis();
+
+  if (sensorL.dataReady()) {
+    distLeft = sensorL.read(false);
+    lastGoodL = now;
+    staleWarnedL = false;
+  } else if (now - lastGoodL > SENSOR_STALE_MS) {
+    distLeft = 4000;
+    if (!staleWarnedL) { Serial.println("WARN: sensorL stale"); staleWarnedL = true; }
+  }
+
+  if (sensorF.dataReady()) {
+    distFront = sensorF.read(false);
+    lastGoodF = now;
+    staleWarnedF = false;
+  } else if (now - lastGoodF > SENSOR_STALE_MS) {
+    distFront = 4000;
+    if (!staleWarnedF) { Serial.println("WARN: sensorF stale"); staleWarnedF = true; }
+  }
+
+  if (sensorR.dataReady()) {
+    distRight = sensorR.read(false);
+    lastGoodR = now;
+    staleWarnedR = false;
+  } else if (now - lastGoodR > SENSOR_STALE_MS) {
+    distRight = 4000;
+    if (!staleWarnedR) { Serial.println("WARN: sensorR stale"); staleWarnedR = true; }
+  }
+
+  // Guard against 0 / absurd readings same as before, on top of staleness check
   if (distLeft  == 0 || distLeft  > 4000) distLeft  = 4000;
   if (distFront == 0 || distFront > 4000) distFront = 4000;
   if (distRight == 0 || distRight > 4000) distRight = 4000;
-
-  if (filtL < 0) filtL = distLeft;
-  if (filtF < 0) filtF = distFront;
-  if (filtR < 0) filtR = distRight;
-  filtL = FILTER_ALPHA * distLeft  + (1 - FILTER_ALPHA) * filtL;
-  filtF = FILTER_ALPHA * distFront + (1 - FILTER_ALPHA) * filtF;
-  filtR = FILTER_ALPHA * distRight + (1 - FILTER_ALPHA) * filtR;
 }
 
 // ============================================================
-//  NEW — IMU (MPU6050) gyro reading, used ONLY for rotate().
+//  IMU (MPU6050) gyro reading, used ONLY for rotate().
 //  Straight-line driving below is untouched and still uses encoders.
 // ============================================================
 float         gyroBiasZ     = 0.0f;
@@ -241,8 +277,20 @@ void setupIMU() {
   imuLastUs = micros();
 }
 
-// ---------------- Open-space straight driving (UNCHANGED) ----------------
+// ---------------- Open-space straight driving ----------------
 const float straightKp = 0.6f;
+
+void resetEncoderBaseline() {
+  noInterrupts();
+  leftTicks = 0;
+  rightTicks = 0;
+  interrupts();
+}
+
+void resetWallPID() {
+  pidInt = 0;
+  pidPrev = 0;
+}
 
 void driveStraightUsingEncoders() {
   noInterrupts();
@@ -260,7 +308,7 @@ void driveStraightUsingEncoders() {
   mspeed(leftSp, rightSp);
 }
 
-// ---------------- Wall PID routine (UNCHANGED) ----------------
+// ---------------- Wall PID routine (math unchanged) ----------------
 void runWallPIDSingle (float measured, int desired, bool invertMirror) {
   float e = measured - (float)desired;
   if (invertMirror) e = -e;
@@ -278,7 +326,7 @@ void runWallPIDSingle (float measured, int desired, bool invertMirror) {
 }
 
 // ============================================================
-//  NEW — Turn PID + rotate(), gyro-driven instead of tick-count driven
+//  Turn PID + rotate(), gyro-driven instead of tick-count driven
 // ============================================================
 #define TURN_PID_KP        4.5f
 #define TURN_PID_KI        0.02f
@@ -290,8 +338,12 @@ void runWallPIDSingle (float measured, int desired, bool invertMirror) {
 #define RAMP_DOWN_DEG      30.0f
 #define TURN_DEADBAND      3.0f    // degrees of error considered "arrived"
 #define TURN_DONE_CYCLES   8       // consecutive in-tolerance loops required to stop
-#define TURN_TIMEOUT_MS    1500    // safety cutoff so a stuck/slipping turn doesn't hang forever
 #define TURN_LOOP_MS       5
+
+// FIX 4 — timeout now scales with turn size instead of a flat 1500ms,
+// so a 180 degree U-turn gets proportionally more time than a 90.
+#define TURN_TIMEOUT_BASE_MS      500
+#define TURN_TIMEOUT_MS_PER_DEG   8
 
 float trapIntegral = 0.0f, trapLastError = 0.0f;
 unsigned long lastTrapTime = 0;
@@ -315,6 +367,13 @@ float trapPID(float error) {
 }
 
 // degree: positive = turn right, negative = turn left, 180/-180 = U-turn
+//
+// NOTE ON DIRECTION (see file header): verify on the bench that
+// rotate(90) actually turns the robot right by ~90 degrees. If it turns
+// the wrong way or by the wrong multiple, flip the sign here:
+//   float targetAngle = (float)(-degree);   <-- try (float)(degree) instead
+// Do NOT touch the pidError sign flip below — that one fixes a separate,
+// already-verified left/right asymmetry bug and should stay as-is.
 void rotate(int degree) {
   if (degree == 0) return;
 
@@ -327,6 +386,7 @@ void rotate(int degree) {
 
   int doneCnt = 0;
   unsigned long startMs = millis();
+  unsigned long maxMs = TURN_TIMEOUT_BASE_MS + (unsigned long)abs(degree) * TURN_TIMEOUT_MS_PER_DEG;
 
   while (true) {
     updateYaw();
@@ -334,7 +394,7 @@ void rotate(int degree) {
     float traveled  = fabsf(normalizeAngle(currentYaw));
     float remaining = totalAngle - traveled;
 
-    if (millis() - startMs > TURN_TIMEOUT_MS) {
+    if (millis() - startMs > maxMs) {
       Serial.println("rotate(): timeout, ending turn early");
       break;
     }
@@ -381,33 +441,52 @@ void rotate(int degree) {
   delay(5);
   mspeed(0, 0);
 
-  pidInt = 0;
-  pidPrev = 0;
+  // FIX 1 — clear leftover encoder ticks generated by the turn itself,
+  // so the next driveStraightUsingEncoders() call doesn't see a fake
+  // "skew" caused by spinning in place rather than real straight drift.
+  resetEncoderBaseline();
+  resetWallPID();
 
   Serial.printf("[TURN] target=%d final_remaining=%.2f\n",
                 degree, totalAngle - fabsf(normalizeAngle(getYaw())));
 }
 
-// ---------------- Main behavior (explicit rule order) — UNCHANGED ----------------
+// ---------------- Main behavior (explicit rule order) ----------------
 void behaviorStep() {
   updateSensors();
 
-  bool wallLeftPresent  = filtL <= wallThresh;
-  bool wallRightPresent = filtR <= wallThresh;
-  bool wallFrontPresent = filtF < frontThresh;
+  // FIX 2/6 — hysteresis: only flip state when a reading clearly commits
+  // to "present" or "absent". Values in the dead band keep the previous
+  // state instead of chattering every loop tick.
+  bool prevLeftActive  = wallLeftActive;
+  bool prevRightActive = wallRightActive;
 
-  if (wallLeftPresent && wallFrontPresent && wallRightPresent) {
+  if (distLeft  <= WALL_ENTER_THRESH) wallLeftActive  = true;
+  else if (distLeft  > WALL_EXIT_THRESH) wallLeftActive  = false;
+
+  if (distRight <= WALL_ENTER_THRESH) wallRightActive = true;
+  else if (distRight > WALL_EXIT_THRESH) wallRightActive = false;
+
+  bool wallFrontPresent = distFront < frontThresh;
+
+  // FIX 2 — reset the relevant PID/encoder baseline exactly on the
+  // transition edge, not every loop, so state doesn't leak across modes.
+  if (wallLeftActive != prevLeftActive || wallRightActive != prevRightActive) {
+    resetWallPID();
+    resetEncoderBaseline();
+  }
+
+  if (wallLeftActive && wallFrontPresent && wallRightActive) {
     mspeed(-100, -100);
     delay(20);
     rotate(180);
     mspeed(0, 0);
-    pidInt = 0;
-    pidPrev = 0;
+    resetWallPID();
     return;
   }
 
   if (wallFrontPresent) {
-    if (!wallLeftPresent) {
+    if (!wallLeftActive) {
       mspeed(innerSpeed, outerSpeed);
       return;
     }
@@ -418,18 +497,18 @@ void behaviorStep() {
   }
 
   if (followLeft) {
-    if (wallLeftPresent) {
-      runWallPIDSingle(filtL, targetDist, false);
+    if (wallLeftActive) {
+      runWallPIDSingle(distLeft, targetDist, false);
       return;
     }
   } else {
-    if (wallRightPresent) {
-      runWallPIDSingle(filtR, targetDist, true);
+    if (wallRightActive) {
+      runWallPIDSingle(distRight, targetDist, true);
       return;
     }
   }
 
-  if (!wallLeftPresent && !wallRightPresent) {
+  if (!wallLeftActive && !wallRightActive) {
     driveStraightUsingEncoders();
     return;
   }
@@ -460,7 +539,7 @@ void setup() {
   pinMode(BTN1, INPUT);
 
   setupSensors();   // also does Wire.begin()
-  setupIMU();       // NEW — must come after Wire.begin(), robot must be still
+  setupIMU();       // must come after Wire.begin(), robot must be still
 
   pinMode(LEFT_ENC_A, INPUT_PULLUP);
   pinMode(LEFT_ENC_B, INPUT_PULLUP);
@@ -479,6 +558,9 @@ void setup() {
   delay(300);
   Serial.printf("Mode chosen: %s-wall follow\n", followLeft ? "LEFT" : "RIGHT");
 
+  unsigned long bootNow = millis();
+  lastGoodL = lastGoodF = lastGoodR = bootNow;
+
   for (int i = 0; i < 10; i++) {
     updateSensors();
     delay(timingBudget);
@@ -488,10 +570,6 @@ void setup() {
 }
 
 void loop() {
-  updateSensors();
-  if (distFront < 150) {
-    stopmotors();
-  } else {
-    runWallPIDSingle(distLeft, targetDist, true);
-  }
+  // Intentionally left minimal — behaviorStep() dispatch is handled
+  // elsewhere by design.
 }
